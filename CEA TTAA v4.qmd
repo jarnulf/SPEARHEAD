@@ -1,0 +1,1150 @@
+---
+title: "Cost-Effectiveness Analysis: Time to Appropriate Antibiotic Therapy (TTAA)"
+subtitle: "Assessing the Economic Value of Rapid Diagnostics in Bloodstream Infections"
+author: "Research Team"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    number-sections: true
+    code-fold: show
+    theme: cosmo
+---
+
+# Introduction
+
+This document contains the source code for a cost-effectiveness model assessing the value of reducing the Time to Appropriate Antibiotic Therapy (TTAA) for hospitalised patients with bloodstream infections (BSI). 
+
+The analysis compares **Standard Care** (Delayed TTAA) vs. **Intervention** (Early TTAA, facilitated by rapid diagnostic technologies). The model uses a decision-analytic framework combining a short-term acute phase (30-day survival) with a long-term Markov extrapolation.
+
+# Setup and Dependencies
+
+We begin by loading the necessary libraries for matrix operations, data manipulation, parallel processing, and visualization.
+
+
+```{r}
+#| label: setup
+
+## Clean memory and load packages
+rm(list = ls())
+# Matrix exponentials and mathematical functions
+library(expm) 
+# Data manipulation and functional programming
+library(dplyr)
+library(tidyr)
+library(purrr)
+# Visualization
+library(ggplot2)
+library(patchwork)
+# Parallel processing for PSA
+library(future)
+library(furrr)
+library(progressr)
+
+# Set up multi-core parallel processing locally
+# Reserves 2 cores for system stability, capping usage at a reasonable limit
+n_cores <- min(parallel::detectCores() - 6, 14) 
+cat("Using", n_cores, "cores for parallel processing\n")
+plan(multisession, workers = n_cores)
+handlers(global = TRUE)
+handlers("progress")
+```
+# Parameters and transformations
+## Hazard Ratio conversion
+The clinical literature often reports the hazard ratio (HR) of mortality per hour of delay in antibiotic administration. However, specific diagnostic technologies reduce TTAA by discrete intervals (e.g., 2 hours, 4 hours).
+The function below converts a per-hour HR into a "per-interval" HR (e.g., HR for a 4-hour reduction) and scales the standard error accordingly using the Delta method.
+```{r}
+#| label: 0.1 Transform per-hour HR to per-interval HR
+getPerIntervalHR <- function(perHourHR,
+                             perHourHRSE, 
+                             DeltaHours = 1) {
+  intHR   = perHourHR ^ DeltaHours
+  intHRSE = DeltaHours * ( perHourHR ^ (DeltaHours - 1) ) * perHourHRSE
+
+  out <- list(intHR = intHR, intHRSE = intHRSE)
+  out
+}
+```
+
+## Model parameters
+This section defines the base case values for the model. These include clinical probabilities, utility weights, costs, and structural assumptions.
+```{r}
+#| label: 0.2 Global Parameter Definition (change assumptions as needed)
+params <- list(
+  # --- PSA Configuration ---
+  N = 2000,                  # Number of Monte Carlo simulations
+
+  # --- Clinical Parameters ---
+  dTTAA_hours    = 4,        # Reduction in time to therapy provided by the technology
+  
+  # Baseline (Delayed Group) Mortality
+  p30_del_mean   = 0.40,     # 30-day mortality probability
+  p30_del_se     = 0.015,
+  
+  # Effectiveness
+  perHourHR      = 0.92,     # HR of mortality per hour reduction in TTAA
+  perHourHRSE    = 0.04,     # Standard Error of the HR
+  
+  # Note: HR_mean and HR_se are placeholders on a per hour basis; they are calculated dynamically below based on dTTAA_hours
+  HR_mean        = 0.89,     
+  HR_se          = 0.04,
+
+  # Long-term Annual Mortality (Conditional on 30-day survival)
+  pLT_del_mean = 0.15,       # Delayed group
+  pLT_del_se   = 0.03,
+  pLT_ear_mean = 0.15,       # Early group (Assumed same as delayed in base case)
+  pLT_ear_se   = 0.03,
+
+  # --- Health State Utilities (QALYs) ---
+  u_acute_mean = 0.60,       # Utility during the acute infection phase
+  u_acute_se   = 0.01,
+  u_LT_mean    = 0.80,       # Utility during the long-term post-acute phase
+  u_LT_se      = 0.02,
+
+  # --- Structural Parameters ---
+  horizon_y          = 10,   # Time horizon in years
+  dt_acute_days      = 1,    # Cycle length for acute phase (days)
+  dt_LT_years        = 1,    # Cycle length for long-term phase (years)
+  discRate           = 0.03, # Discount rate for costs and outcomes
+
+  # --- Cost Parameters (CHF) ---
+  # Hospitalization
+  cost_perHospDay_mean    = 975,
+  costMultiplier_HospDay  = 0.30, # Used to define variance in PSA (Gamma dist)
+  
+  # Length of Stay (LOS) Impact
+  baseline_LOS_days  = 15,      # Baseline LOS for delayed group survivors
+  dLOS_perHour_mean  = -0.134,  # Reduction in LOS days per hour of TTAA reduction
+  dLOS_perHour_se    = 0.008,
+  
+  # Technology Costs
+  tech_cost_total         = 500000, # Fixed investment cost
+  n_patients_using_tech   = 5000,   # Volume of patients over horizon
+  tech_cost_per_patient   = NA,     # Calculated below
+  
+  # Long-term Management Costs (Annual)
+  LT_cost_delayed_mean    = 0,      
+  LT_cost_delayed_se      = 1000,
+  LT_cost_early_mean      = 0,
+  LT_cost_early_se        = 1000,
+  costMultiplier_LT       = 0.30,
+
+  # WTP threshold
+  WTP                     = 100000
+  )
+
+# Derived Parameters: Convert per-hour HR to the specific interval HR
+hrk <- getPerIntervalHR(params$perHourHR, params$perHourHRSE, params$dTTAA_hours)
+params$HR_mean <- hrk$intHR
+params$HR_se   <- hrk$intHRSE
+
+# Derived Parameters: Calculate per-patient technology cost
+if (is.na(params$tech_cost_per_patient)) {
+  params$tech_cost_per_patient <- params$tech_cost_total / params$n_patients_using_tech
+}
+
+```
+
+# Model structure
+
+## Hazard and transition probability functions
+These functions generate the Transition Probability Matrices (TPM) used in the Markov traces
+```{r}
+#| label: 1.1 Hazard Rate Conversion
+# Use 30-day mortality to obtain a per-day hazard rate, under assumption of constant hazard over 30 days
+hazard_p30delayed <- function(p30_delayed, days = 30) {
+    if (p30_delayed <= 0 | p30_delayed >= 1) stop("p30_delayed is a probability and must be in (0,1).")
+        -log(1-p30_delayed) /days
+}
+```
+
+```{r}
+#| label: 1.2 Transition Probability Matrices
+# Create TP matrices for acute phase (e.g. here 30 days) and long-term phase
+# s: probablity of surivival in the next time step dt, given survival up to time t; i.e. no event between t and {t+dt} given survival up to t.
+acuteTPM <- function(h, dt_days = 1) {
+    s <- exp(-h * dt_days)
+    matrix(c(s, 1-s, 
+             0, 1),
+           nrow = 2, byrow = T,
+           dimnames = list(c("alive", "dead"), c("alive", "dead"))
+           )
+           }
+
+LT_TPM <- function(p_yearly, dt_years = 1) { 
+    if (p_yearly <0 || p_yearly >= 1) stop("p_yearly is a probability and must be in [0,1).")
+    s_yearly <- 1 - p_yearly
+    s_dt <- s_yearly^dt_years # per-cycle survival (dt_years = 1/12 for monthly; = 1 for yearly)
+    matrix(c(s_dt, 1-s_dt, 
+             0, 1),
+           nrow = 2, byrow = T,
+           dimnames = list(c("alive", "dead"), c("alive", "dead"))
+           )
+           }
+
+```
+
+# Health Outcomes Calculation
+## Acute Phase (First 30 Days)
+This function calculates survival curves, expected life-days, and QALYs accrued during the initial hospitalization period.
+
+```{r}
+#| label: 1.3 Calculate expected time alive and QALYs in acute phase
+haz30 <- hazard_p30delayed(0.3)
+TPM30 <- acuteTPM(haz30)
+
+acute_outcomes <- function(h, T_days = 30, dt_acute_days = 1, u_acute = 0.7) {
+    n_cycles <- T_days / dt_acute_days
+    P <- acuteTPM(h, dt_acute_days)
+    I2 <- diag(2)
+    dimnames(I2)[2] <- dimnames(P)[2]
+
+    # Build a list of P to powers: P^0==I, P^1, P^2, P^3, ..., P^N, so total length of list is N+1
+    P_n <- accumulate(
+        .x = seq_len(n_cycles),
+        .init = I2,
+        .f = ~ .x %*% P
+        )
+
+    # Initial distribution of states: alives and deads, row vector i.e. 1, 0: all alive
+    p_states0 <-matrix(c(1,0), nrow = 1, dimnames = list(NULL, c("alive", "dead")))
+
+    # Start of cycle distributions dead/alive NB: P_n has length 31. dist_states0 * P^k for k = 0,...,N-1 (so index 1 is P^0 and index 31 is P^30)
+    p_states_beginning <- map(P_n[1:n_cycles], ~ p_states0 %*% .x)
+
+    # End of horizon distributions: dist_states0 * P^N
+    p_states_T <- p_states0 %*% P_n[[n_cycles+1]]
+
+    # Extract vector of proportion of alives; and end states
+    p_alive_beginning <- map_dbl(p_states_beginning, ~ .x[,"alive"])
+    p_alive_T <- p_states_T[,"alive"]
+    p_dead_T <- p_states_T[,"dead"]
+
+    # Expected time alive in acute phase; QALYs accumulated over acute phase
+    exp_days_alive <- map_dbl(p_states_beginning, ~ .x[1,1]) |> sum() *dt_acute_days
+    exp_years_alive <- exp_days_alive /365
+    qaly_acute <- u_acute * exp_years_alive
+    
+    list(
+    p_alive_beginning = p_alive_beginning,
+    p_alive_T = p_alive_T,
+    p_dead_T = p_dead_T,
+    exp_days_alive_acute = exp_days_alive,
+    exp_years_alive_acute = exp_years_alive,
+    qaly_acute = qaly_acute
+    )
+    }
+```
+
+## Long-Term Phase (Post-30 Days)
+This function models the trajectory of survivors from the acute phase over the remaining time horizon.
+
+```{r}
+#| label: 1.4 Calculate post-acute long-term time life-years and QALYs
+# h_longTerm_annual is the hazard rate (assumed constant) that applies to survivors of the BSI post the acute phase
+# Need to fill in the u_LT with something reasonable instead of 1
+
+longTerm_outcomes <- function(p_longTerm_annual, horizon_y = 10, dt_LT_years = 1, discRate = 0.03, u_LT = 1) {
+    n_cycles <- ceiling(horizon_y / dt_LT_years)
+    P <- LT_TPM(p_longTerm_annual, dt_LT_years)
+    I2 <- diag(2)
+    dimnames(I2)[2] <- dimnames(P)[2]
+
+    P_n <- accumulate(
+    .x = seq_len(n_cycles),
+    .init = I2,
+    .f = ~ .x %*% P
+    )
+
+    # Beginning of cycles distributions
+    p_states0 <-matrix(c(1,0), nrow = 1, dimnames = list(NULL, c("alive", "dead")))
+    p_states_beginning <- map(P_n[1:n_cycles], ~ p_states0 %*% .x)
+    p_alive_beginning <- map_dbl(p_states_beginning, ~ .x[,"alive"])
+
+    # Discounting life time
+    discFactor_percycle <- 1 / ((1 + discRate)^dt_LT_years) # per-cycle discount factor
+    v_discFact <- discFactor_percycle^(0 : (n_cycles - 1)) # vector of DFs for each time step, starting at year 1 when no discouting (power 0)
+    disc_timeAlivePost <- p_alive_beginning * v_discFact
+    sum_disc_timeAlivePost <- sum(disc_timeAlivePost)
+    LY_LT <- sum_disc_timeAlivePost * dt_LT_years # * by dt_LT_years is converting untis from months (unit of dt) to years!
+    qaly_LT <- LY_LT * u_LT
+
+    list(
+    p_alive_beginning = p_alive_beginning,
+    exp_years_alive_LT = LY_LT,
+    qaly_LT = qaly_LT,
+    v_discFact = v_discFact
+    )
+}
+
+```
+
+# Cost Calculations
+This function aggregates costs from all sources: acute hospitalization, technology implementation, and long-term care. It accounts for the differential Length of Stay (LOS) driven by early treatment.
+
+```{r}
+#| label: cost-calculations
+calculate_costs <- function(
+    # Acute phase parameters
+    exp_days_alive_acute_delayed,
+    exp_days_alive_acute_early,
+    dLOS_perHour,
+    dTTAA_hours,
+    cost_perHospDay,
+    
+    # Technology costs
+    tech_cost_per_patient,
+    
+    # Long-term parameters
+    p_alive_T_delayed,
+    p_alive_T_early,
+    p_alive_beginning_LT_delayed,
+    p_alive_beginning_LT_early,
+    LT_cost_delayed_annual,
+    LT_cost_early_annual,
+    
+    # Model structure
+    dt_LT_years,
+    discRate,
+    horizon_y
+    ) {
+    
+    # Calculate number of long-term cycles
+    n_cycles_LT <- ceiling(horizon_y / dt_LT_years)
+    
+    # Discount factors for costs (same as for QALYs)
+    discFactor_percycle <- 1 / ((1 + discRate)^dt_LT_years)
+    v_discFact <- discFactor_percycle^(0 : (n_cycles_LT - 1))
+    
+    # ACUTE PHASE COSTS (Hospitalization)
+    baseline_LOS_days <- 10  # Baseline length of stay
+    
+    # Actual LOS for each group
+    LOS_delayed <- baseline_LOS_days
+    LOS_early <- baseline_LOS_days + (dLOS_perHour * dTTAA_hours) # Should be negative reduction due to dLOS_perHour <= 0; pmax to avoid negative values if baseline LOS is low
+    
+    # Hospitalization costs
+    hosp_cost_delayed <- LOS_delayed * cost_perHospDay
+    hosp_cost_early <- LOS_early * cost_perHospDay
+    
+    # TECHNOLOGY COSTS
+    # Only early group uses the new technology; default late tech is 0 but can input costs if known
+    tech_cost_delayed <- 0
+    tech_cost_early <- tech_cost_per_patient
+    
+    # LONG-TERM COSTS
+    # Discounted long-term costs: first per survivor, then actual costs accounting for proporion that survived at end of acute phase
+    if (length(p_alive_beginning_LT_delayed) > 0) {
+        # Annual costs multiplied by probability alive and discount factor (scalars recycled to length equal n_cycles)
+        LT_costs_delayed_disc <- sum(p_alive_beginning_LT_delayed * LT_cost_delayed_annual * v_discFact * dt_LT_years)
+        LT_costs_early_disc <- sum(p_alive_beginning_LT_early * LT_cost_early_annual * v_discFact * dt_LT_years)
+        
+        # Adjust for probability of surviving acute phase
+        LT_costs_delayed_total <- p_alive_T_delayed * LT_costs_delayed_disc
+        LT_costs_early_total <- p_alive_T_early * LT_costs_early_disc
+    } else {
+        LT_costs_delayed_total <- 0
+        LT_costs_early_total <- 0
+    }
+    
+    # TOTAL COSTS BY ARM
+    total_cost_delayed <- hosp_cost_delayed + tech_cost_delayed + LT_costs_delayed_total
+    total_cost_early <- hosp_cost_early + tech_cost_early + LT_costs_early_total
+    
+    # COST DIFFERENCES (early - delayed)
+    d_hosp_costs <- hosp_cost_early - hosp_cost_delayed
+    d_tech_costs <- tech_cost_early - tech_cost_delayed
+    d_LT_costs <- LT_costs_early_total - LT_costs_delayed_total
+    d_total_costs <- total_cost_early - total_cost_delayed
+    
+    list(
+        # Individual cost components for each arm
+        hosp_cost_delayed = hosp_cost_delayed,
+        tech_cost_delayed = tech_cost_delayed,
+        LT_cost_delayed = LT_costs_delayed_total,
+        total_cost_delayed = total_cost_delayed,
+        
+        hosp_cost_early = hosp_cost_early,
+        tech_cost_early = tech_cost_early,
+        LT_cost_early = LT_costs_early_total,
+        total_cost_early = total_cost_early,
+        
+        # Differences (early - delayed)
+        d_hosp_costs = d_hosp_costs,
+        d_tech_costs = d_tech_costs,
+        d_LT_costs = d_LT_costs,
+        d_total_costs = d_total_costs,
+        
+        # Additional outputs
+        LOS_delayed = LOS_delayed,
+        LOS_early = LOS_early,
+        d_LOS_days = LOS_early - LOS_delayed
+    )
+}
+```
+
+# Preparing arm-specific health outcomes prior to contrasting
+
+
+```{r}
+#| label: 2.1 Outcomes per arm: delayed (baseline) vs early therapy
+outcomes_perArm <- function(p30_delayed, 
+                            HR_earlyVSdelayed, 
+                            pLT_del_annual = 0.15,
+                            pLT_ear_annual = 0.15,
+                            horizon_y = 10, 
+                            dt_acute_days = 1,
+                            dt_LT_years = 1,
+                            discRate = 0.03,
+                            u_acute = 0.7, 
+                            u_LT = 1,
+                            cost_perHospDay = 1250,
+                            dLOS_perHour = -0.134,
+                            dTTAA_hours = 1,
+                            tech_cost_per_patient = 500,
+                            LT_cost_delayed_annual = 5000,
+                            LT_cost_early_annual = 5000) {
+    
+    # Arm-specific acute phase outcomes
+    h_delayedTTAA <- hazard_p30delayed(p30_delayed, days = 30)
+    h_earlyTTAA <- h_delayedTTAA * HR_earlyVSdelayed
+
+    acuteOutcomesDelayed <- acute_outcomes(h_delayedTTAA, T_days = 30, dt_acute_days, u_acute)
+    acuteOutcomesEarly <- acute_outcomes(h_earlyTTAA, T_days = 30, dt_acute_days, u_acute)
+
+    # Arm-specific long-term outcomes
+    LTdelayed <- longTerm_outcomes(pLT_del_annual, horizon_y, dt_LT_years, discRate, u_LT)
+    LTearly <- longTerm_outcomes(pLT_ear_annual, horizon_y, dt_LT_years, discRate, u_LT)
+
+    # Arm-specific QALYs
+    qaly_delayed <- acuteOutcomesDelayed$qaly_acute + 
+        u_LT * (acuteOutcomesDelayed$p_alive_T * LTdelayed$exp_years_alive_LT)
+    qaly_early <- acuteOutcomesEarly$qaly_acute + 
+        u_LT * (acuteOutcomesEarly$p_alive_T * LTearly$exp_years_alive_LT)
+
+    # Calculate costs
+    costs <- calculate_costs(
+        exp_days_alive_acute_delayed = acuteOutcomesDelayed$exp_days_alive_acute,
+        exp_days_alive_acute_early = acuteOutcomesEarly$exp_days_alive_acute,
+        dLOS_perHour = dLOS_perHour,
+        dTTAA_hours = dTTAA_hours,
+        cost_perHospDay = cost_perHospDay,
+        tech_cost_per_patient = tech_cost_per_patient,
+        p_alive_T_delayed = acuteOutcomesDelayed$p_alive_T,
+        p_alive_T_early = acuteOutcomesEarly$p_alive_T,
+        p_alive_beginning_LT_delayed = LTdelayed$p_alive_beginning,
+        p_alive_beginning_LT_early = LTearly$p_alive_beginning,
+        LT_cost_delayed_annual = LT_cost_delayed_annual,
+        LT_cost_early_annual = LT_cost_early_annual,
+        dt_LT_years = dt_LT_years,
+        discRate = discRate,
+        horizon_y = horizon_y
+    )
+
+    list(HR_earlyVSdelayed = HR_earlyVSdelayed,
+        h_delayedTTAA,
+        h_earlyTTAA,
+        S30_delayed = acuteOutcomesDelayed$p_alive_T,
+        S30_early = acuteOutcomesEarly$p_alive_T,
+        qaly_delayed = qaly_delayed,
+        qaly_early = qaly_early,
+        pLT_del_annual,
+        pLT_ear_annual,
+        LYdelayed = LTdelayed$exp_years_alive_LT,
+        LYearly = LTearly$exp_years_alive_LT,
+        costs = costs
+    )
+    }
+```
+
+# Calculate contrasts
+
+```{r}
+#| label: 2.2 Generate contrast: early vs delayed TTAA; generate NMB and ICER
+
+contrastsTTAA <- function(p30_delayed, 
+                        HR_earlyVSdelayed, 
+                        pLT_del_annual = 0.15,
+                        pLT_ear_annual = 0.15,
+                        horizon_y = 10, 
+                        dt_acute_days = 1,
+                        dt_LT_years = 1,
+                        discRate = 0.03,
+                        u_acute = 0.7, 
+                        u_LT = 1,
+                        dLOS_perHour,
+                        cost_perHospDay,
+                        dTTAA_hours,
+                        tech_cost_per_patient = 500,
+                        LT_cost_delayed_annual = 5000,
+                        LT_cost_early_annual = 5000,                        
+                        WTP = NULL) {
+                            
+    outcomes2Arms <- outcomes_perArm(
+      p30_delayed               = p30_delayed,
+      HR_earlyVSdelayed         = HR_earlyVSdelayed,
+      pLT_del_annual            = pLT_del_annual,
+      pLT_ear_annual            = pLT_ear_annual,
+      horizon_y                 = horizon_y,
+      dt_acute_days             = dt_acute_days,
+      dt_LT_years               = dt_LT_years,
+      discRate                  = discRate,
+      u_acute                   = u_acute,
+      u_LT                      = u_LT,
+      cost_perHospDay           = cost_perHospDay,
+      dLOS_perHour              = dLOS_perHour,
+      dTTAA_hours               = dTTAA_hours,
+      tech_cost_per_patient     = tech_cost_per_patient,
+      LT_cost_delayed_annual    = LT_cost_delayed_annual,
+      LT_cost_early_annual      = LT_cost_early_annual      
+    )
+
+    d_qalys <- outcomes2Arms$qaly_early - outcomes2Arms$qaly_delayed
+    d_S30 <- outcomes2Arms$S30_early - outcomes2Arms$S30_delayed
+    costs <- outcomes2Arms$costs
+
+    out <- tibble(
+        p30_delayed, HR_earlyVSdelayed, u_acute, u_LT, pLT_del_annual, pLT_ear_annual, 
+        horizon_y, dt_acute_days, dt_LT_years, discRate,
+        
+        # Effectiveness outcomes
+        d_qalys = d_qalys,
+        d_S30 = d_S30,
+        qaly_delayed = outcomes2Arms$qaly_delayed,
+        qaly_early = outcomes2Arms$qaly_early,
+        S30_delayed = outcomes2Arms$S30_delayed,
+        S30_early = outcomes2Arms$S30_early,
+        
+        # Time to treatment
+        dTTAA_hours = dTTAA_hours,
+        
+        # Length of stay
+        dLOS_perHour = dLOS_perHour,
+        LOS_delayed = costs$LOS_delayed,
+        LOS_early = costs$LOS_early,
+        d_LOS_days = costs$d_LOS_days,
+        
+        # Cost components - by arm
+        cost_perHospDay = cost_perHospDay,
+        hosp_cost_delayed = costs$hosp_cost_delayed,
+        tech_cost_delayed = costs$tech_cost_delayed,
+        LT_cost_delayed = costs$LT_cost_delayed,
+        total_cost_delayed = costs$total_cost_delayed,
+
+        hosp_cost_early = costs$hosp_cost_early,
+        tech_cost_early = costs$tech_cost_early,
+        LT_cost_early = costs$LT_cost_early,
+        total_cost_early = costs$total_cost_early,
+        
+        # Cost differences
+        d_hosp_costs = costs$d_hosp_costs,
+        d_tech_costs = costs$d_tech_costs,
+        d_LT_costs = costs$d_LT_costs,
+        d_total_costs = costs$d_total_costs
+    )
+
+    if (!is.null(WTP)) {
+        out <- out |> mutate(
+            WTP = WTP,
+            headroom = WTP * d_qalys,
+            NMB = WTP * d_qalys - d_total_costs,
+            ICER = d_total_costs / d_qalys,
+            CE_decision = if_else(ICER <= WTP, "Cost-effective", "Not cost-effective")
+        )
+    }
+    out
+}
+```
+
+# Probabilistic sensitivity analysis
+
+## Assumptions on how to describe sampling uncertainty around key parameters
+PSA allows us to account for parameter uncertainty. Instead of using point estimates, we draw parameters from probability distributions.Sampling DistributionsWe employ the Method of Moments to fit standard distributions to our input parameters (mean and standard error):Beta Distribution: Used for probabilities (bounded 0 to 1).Log-Normal Distribution: Used for Hazard Ratios (bounded > 0, skewed).Gamma Distribution: Used for costs (bounded > 0, skewed). For the Gamma distribution, we fit the shape ($k$) and scale ($\theta$) parameters such that specific quantiles (2.5% and 97.5%) align with a defined variance (e.g., mean $\pm$ 30%).
+```{r}
+#| label: 4.1 PSA Distribution Helper Functions
+# Build PSA helper function for probabilistic draws; input sample mean and SE that will be treated as actual mean and SD of distribution
+draw_Beta_MOM <- function(N, theta, SEtheta) {
+    a <- theta * ( theta * (1 - theta) /SEtheta^2 - 1)
+    b <- ( 1 - theta ) * ( theta * (1 - theta) / SEtheta^2 - 1)
+    rbeta(n = N, shape1 = a, shape2 = b)
+    }
+
+
+drawHR_Normal_MOM <- function(N, meanHR, SEHR) {
+    SD_logNormal = log((SEHR/meanHR)^2 +1) |> sqrt()
+    mean_logNormal = log(meanHR) - 0.5 * (SD_logNormal)^2
+    HR_draws <- rlnorm(N, meanlog = mean_logNormal, sdlog = SD_logNormal)
+    HR_draws
+    }
+
+
+draw_Gamma_withMean <- function(N, mu_gamma, meanMultiplier) {
+    quantiles <- c(0.025, 0.975)
+    target_qvalues <- c(mu_gamma * (1 - meanMultiplier), mu_gamma * (1 + meanMultiplier))
+
+    # insert log of k just to prevent negative values of k (when re-exponentiatied) since k must be positive
+    getSSE <- function(lnk) {
+            k = exp(lnk)
+            theta = mu_gamma / k
+            draw_qgamma <- qgamma(quantiles, shape = k, scale = theta)
+            SSE <- sum((target_qvalues - draw_qgamma)^2)
+            SSE
+            }
+    
+    lnk_hat <- optimize(getSSE, interval = c(-20, 20))$minimum
+    k <- exp(lnk_hat)
+    theta <- mu_gamma / k
+    # Now parameterise gamma dist and draw
+    rgamma(N, shape = k, scale = theta)
+    }
+
+```
+
+## PSA execution
+
+This function generates the random draws for all parameters and executes the model in parallel for $N$ iterations.
+
+```{r}
+#| label: 4.2 PSA Execution Function
+# PSA function that will run on contrastsTTAA function
+psa_contrastsTTAA <- function(
+    N,
+    p30_del_mean, p30_del_se,
+    HR_mean, HR_se,
+    pLT_del_mean, pLT_del_se,
+    pLT_ear_mean, pLT_ear_se,
+    u_acute_mean, u_acute_se,
+    u_LT_mean, u_LT_se,
+    horizon_y, dt_acute_days, dt_LT_years, discRate,
+    dTTAA_hours,
+    dLOS_perHour_mean, dLOS_perHour_se,
+    cost_perHospDay_mean, costMultiplier_HospDay,
+    tech_cost_per_patient,
+    LT_cost_delayed_mean, LT_cost_delayed_se,
+    LT_cost_early_mean, LT_cost_early_se,
+    costMultiplier_LT,
+    WTP = NULL) {
+         # Clinical parameters
+        p30_delayed = draw_Beta_MOM(N, p30_del_mean, p30_del_se)
+        HR_earlyVSdelayed = drawHR_Normal_MOM(N, meanHR = HR_mean, SEHR = HR_se)
+        pLT_del_annual = draw_Beta_MOM(N, pLT_del_mean, pLT_del_se)
+        pLT_ear_annual = draw_Beta_MOM(N, pLT_ear_mean, pLT_ear_se)
+
+        # Length of stay impact
+        dLOS_perHour = rnorm(N, dLOS_perHour_mean, dLOS_perHour_se)
+
+        # Utilities
+        u_acute = draw_Beta_MOM(N, u_acute_mean, u_acute_se)
+        u_LT = draw_Beta_MOM(N, u_LT_mean, u_LT_se)
+
+        # COSTS
+        # Hospitalisation costs per day
+        cost_perHospDay = draw_Gamma_withMean(N, mu_gamma = cost_perHospDay_mean, meanMultiplier = costMultiplier_HospDay)
+        # Long-term costs: deterministic version
+        # LT_cost_delayed_annual = rep(LT_cost_delayed_mean, N)
+        # LT_cost_early_annual = rep(LT_cost_early_mean, N)
+
+        # Long-term costs: stochastic version, using Gamma distribution
+        LT_cost_delayed_annual = draw_Gamma_withMean(N, mu_gamma = LT_cost_delayed_mean, meanMultiplier = costMultiplier_LT)
+        LT_cost_early_annual = draw_Gamma_withMean(N, mu_gamma = LT_cost_early_mean, meanMultiplier = costMultiplier_LT)
+
+        # Technology costs: for now deterministic
+        tech_cost_per_patient = rep(tech_cost_per_patient, N)
+
+        
+        draws <- tibble(
+            p30_delayed               = p30_delayed,
+            HR_earlyVSdelayed         = HR_earlyVSdelayed,
+            pLT_del_annual            = pLT_del_annual,
+            pLT_ear_annual            = pLT_ear_annual,
+            horizon_y                 = horizon_y,
+            dt_acute_days             = dt_acute_days,
+            dt_LT_years               = dt_LT_years,
+            discRate                  = discRate,
+            u_acute                   = u_acute,
+            u_LT                      = u_LT,
+            WTP                       = WTP,
+            dTTAA_hours               = dTTAA_hours,
+            cost_perHospDay           = cost_perHospDay,
+            dLOS_perHour              = dLOS_perHour,
+            tech_cost_per_patient     = tech_cost_per_patient,
+            LT_cost_delayed_annual    = LT_cost_delayed_annual,
+            LT_cost_early_annual      = LT_cost_early_annual
+        )
+        
+        #psa_runs <- pmap_dfr(draws, contrastsTTAA)
+        psa_runs <- future_pmap_dfr(draws, contrastsTTAA, .progress = TRUE)
+        psa_runs
+        }
+
+```
+
+
+# Results
+## Run PSA
+
+```{r}
+#| label: 5.1 Running model with input parameters in section 0.0
+results_psa <- psa_contrastsTTAA(
+  N                      = params$N,
+  p30_del_mean           = params$p30_del_mean,
+  p30_del_se             = params$p30_del_se,
+  HR_mean                = params$HR_mean,
+  HR_se                  = params$HR_se,
+  pLT_del_mean           = params$pLT_del_mean,
+  pLT_del_se             = params$pLT_del_se,
+  pLT_ear_mean           = params$pLT_ear_mean,
+  pLT_ear_se             = params$pLT_ear_se,
+  u_acute_mean           = params$u_acute_mean,
+  u_acute_se             = params$u_acute_se,
+  u_LT_mean              = params$u_LT_mean,
+  u_LT_se                = params$u_LT_se,
+  horizon_y              = params$horizon_y,
+  dt_acute_days          = params$dt_acute_days,
+  dt_LT_years            = params$dt_LT_years,
+  discRate               = params$discRate,
+  dTTAA_hours            = params$dTTAA_hours,
+  dLOS_perHour_mean      = params$dLOS_perHour_mean,
+  dLOS_perHour_se        = params$dLOS_perHour_se,
+  cost_perHospDay_mean   = params$cost_perHospDay_mean,
+  costMultiplier_HospDay = params$costMultiplier_HospDay,
+  tech_cost_per_patient  = params$tech_cost_per_patient,
+  LT_cost_delayed_mean   = params$LT_cost_delayed_mean,
+  LT_cost_delayed_se     = params$LT_cost_delayed_se,
+  LT_cost_early_mean     = params$LT_cost_early_mean,
+  LT_cost_early_se       = params$LT_cost_early_se,
+  costMultiplier_LT      = params$costMultiplier_LT,
+  WTP                    = params$WTP
+)
+```
+
+## Visualisation plots
+
+```{r}
+#| label: 6.1 Distribution plots
+# Incremental QALYs
+p1 <- ggplot(results_psa, aes(x = d_qalys)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.7) +
+  geom_vline(xintercept = mean(results_psa$d_qalys), 
+             linetype = "dashed", color = "red", size = 1) +
+  labs(x = "Incremental QALYs", y = "Frequency",
+       title = "Distribution of Incremental QALYs") +
+  theme_minimal() +
+    theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+# Incremental costs
+p2 <- ggplot(results_psa, aes(x = d_total_costs)) +
+  geom_histogram(bins = 50, fill = "coral", alpha = 0.7) +
+  geom_vline(xintercept = mean(results_psa$d_total_costs), 
+             linetype = "dashed", color = "red", size = 1) +
+  labs(x = "Incremental Costs (CHF)", y = "Frequency",
+       title = "Distribution of Incremental Costs") +
+  theme_minimal() +
+    theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+# Net Monetary Benefit
+p3 <- ggplot(results_psa, aes(x = NMB)) +
+  geom_histogram(bins = 50, fill = "lightgreen", alpha = 0.7) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "black", size = 1) +
+  geom_vline(xintercept = mean(results_psa$NMB), 
+             linetype = "dashed", color = "darkgreen", size = 1) +
+  labs(x = "Net Monetary Benefit (CHF)", y = "Frequency",
+       title = paste0("NMB Distribution (WTP = CHF", params$WTP, ")")) +
+  theme_minimal() +
+    theme(
+    plot.title = element_text(size = 24, face = "bold"),
+    axis.title.x = element_text(size = 20),
+    axis.title.y = element_text(size = 20),
+    axis.text = element_text(size = 12)
+  )
+
+(p1 + p2) / p3
+
+ggsave("./plots/Distributions.png", width = 10, height = 7, dpi = 300, bg = "white")
+
+```
+
+## Cost-Effectiveness Plane
+Scatter plot of incremental costs versus incremental QALYs. The red dashed line represents the Willingness-to-Pay (WTP) threshold. Points below this line are cost-effective.
+
+```{r}
+#| label: 6.2 Cost-effectiveness plane
+
+ggplot(results_psa, aes(x = d_qalys, y = d_total_costs)) +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  geom_abline(slope = results_psa$WTP, intercept = 0, linetype = 2, color = "red") +
+  geom_abline(slope = (results_psa$WTP * 0.25), intercept = 0, linetype = 2, color = "blue") +
+  geom_point(alpha = 0.25, size = 1.2) +
+  labs(title = "Cost-Effectiveness Plane",
+       x = "Difference in QALYs (Early − Delayed)",
+       y = "Difference in Costs (CHF, Early − Delayed)") +
+  coord_cartesian(ylim = c(-800, 400)) +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(size = 24, face = "bold"),
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 20),
+        axis.text = element_text(size = 12)
+    )
+
+ggsave("./plots/CEplane.png", width = 10, height = 7, dpi = 300, bg = "white")
+```
+
+## Cost-Effectiveness Acceptability Curve (CEAC)
+The CEAC shows the probability that the intervention is cost-effective at varying thresholds of Willingness-to-Pay.
+
+```{r}
+#| label: 6.3 Cost-effectiveness acceptability curve
+
+# Calculate CEAC
+wtp_range <- seq(0, 200000, by = 10)
+
+# For each level of WTP, show the proportion of draws (in results_psa) that result in a positive MNB
+ceac_data <- map_dfr(wtp_range, function(wtp) {
+  results_psa |>
+    mutate(ce = (wtp * d_qalys - d_total_costs) > 0) |>
+    summarise(WTP = wtp, prob_CE = mean(ce))
+})
+
+# Plot CEAC
+ggplot(ceac_data, aes(x = WTP, y = prob_CE)) +
+  geom_line(color = "steelblue", size = 1.5) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = params$WTP, linetype = "dashed", color = "red") +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(x = "Willingness-to-Pay Threshold (CHF/QALY)",
+       y = "Probability Cost-Effective",
+       title = "Cost-Effectiveness Acceptability Curve") +
+  theme_minimal() +
+    theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text = element_text(size = 12)
+  )
+
+ggsave("./plots/CEAC.png", width = 10, height = 7, dpi = 300, bg = "white")
+```
+
+## One-Way Sensitivity Analysis (Tornado Plot)
+This section calculates the impact of varying single parameters on the Net Monetary Benefit (NMB). We use the 2.5th and 97.5th percentiles from the PSA distributions as the "Low" and "High" values for the deterministic sensitivity analysis.
+
+```{r}
+#| label: 6.4 Tornado plot, one-way sensitivity analysis (owsa) for the NMB
+# Quantile funtions - recycle code from earlier but make output = quantile values
+beta_qt <- function(theta, SEtheta, p = c(0.025, 0.975)) {
+    a <- theta * ( theta * (1 - theta) /SEtheta^2 - 1)
+    b <- ( 1 - theta ) * ( theta * (1 - theta) / SEtheta^2 - 1)
+    qbeta(p, a, b)
+    }
+
+lnorm_qt <- function(meanHR, SEHR, p = c(0.025, 0.975)) {
+  SD_logNormal = log((SEHR/meanHR)^2 +1) |> sqrt()
+  mean_logNormal = log(meanHR) - 0.5 * (SD_logNormal)^2
+  qlnorm(p, mean_logNormal, SD_logNormal)
+}
+
+norm_qt <- function(mean, se, p = c(0.025, 0.975)) {
+  qnorm(p, mean, se)
+}
+
+# Run onsa on per hour HR rather than derived interval-HR, which also used Delta method to derive SEs
+perHourHR_low  <- lnorm_qt(params$perHourHR, params$perHourHRSE)[1]
+perHourHR_high <- lnorm_qt(params$perHourHR, params$perHourHRSE)[2]
+
+
+# Parameter means or base values
+param_base <- list(
+  p30_delayed = params$p30_del_mean,
+  HR_earlyVSdelayed = params$HR_mean,
+  pLT_del_annual = params$pLT_del_mean,
+  pLT_ear_annual = params$pLT_ear_mean,
+  u_acute = params$u_acute_mean,
+  u_LT = params$u_LT_mean,
+  cost_perHospDay = params$cost_perHospDay_mean,
+  dLOS_perHour = params$dLOS_perHour_mean,
+  tech_cost_per_patient = params$tech_cost_per_patient,
+  horizon_y = params$horizon_y,
+  dt_acute_days = params$dt_acute_days,
+  dt_LT_years = params$dt_LT_years,
+  discRate = params$discRate,
+  dTTAA_hours = params$dTTAA_hours,
+  LT_cost_delayed_annual = params$LT_cost_delayed_mean,
+  LT_cost_early_annual = params$LT_cost_early_mean,
+  WTP = params$WTP
+  )
+
+baseNMB <- do.call(contrastsTTAA, param_base)$NMB
+
+# Save parameters to vary in one way sensitivity analysis; tribble to write out row-wise
+owsa_params <- tribble(
+  ~parameter, ~label, ~low, ~high,
+  "p30_delayed", "30-day mortality (delayed)", beta_qt(params$p30_del_mean, params$p30_del_se)[1], beta_qt(params$p30_del_mean, params$p30_del_se)[2],
+  #"HR_earlyVSdelayed", "Hazard ratio (per hour)", lnorm_qt(params$HR_mean, params$HR_se)[1], lnorm_qt(params$HR_mean, params$HR_se)[2],  # this version runs ONSA on the "derived" interval-HR
+  "HR_earlyVSdelayed", "Hazard ratio (per hour)", perHourHR_low ^ params$dTTAA_hours, perHourHR_high ^ params$dTTAA_hours, # this version runs ONSA on the original HR
+  "pLT_del_annual", "Long-term mortality (delayed)", beta_qt(params$pLT_del_mean, params$pLT_del_se)[1], beta_qt(params$pLT_del_mean, params$pLT_del_se)[2],
+  "pLT_ear_annual", "Long-term mortality (early)", beta_qt(params$pLT_ear_mean, params$pLT_ear_se)[1], beta_qt(params$pLT_ear_mean, params$pLT_ear_se)[2],
+  "u_acute", "Utility (acute phase)", beta_qt(params$u_LT_mean, params$u_LT_se)[1], beta_qt(params$u_LT_mean, params$u_LT_se)[2],
+  "u_LT", "Utility (long-term)", beta_qt(params$u_LT_mean, params$u_LT_se)[1], beta_qt(params$u_LT_mean, params$u_LT_se)[2],
+  "dLOS_perHour", "LOS reduction (per hour)", norm_qt(params$dLOS_perHour_mean, params$dLOS_perHour_se)[1], norm_qt(params$dLOS_perHour_mean, params$dLOS_perHour_se)[2],
+  "cost_perHospDay", "Hospital cost (per day)", params$cost_perHospDay_mean * 0.7, params$cost_perHospDay_mean * 1.3,
+  "tech_cost_per_patient", "Technology cost (per patient)", params$tech_cost_per_patient * 0.1, params$tech_cost_per_patient * 10
+)
+
+# Produce spread between low and high values of NMB, per parametere varied
+owsa_results <- owsa_params |>
+  rowwise() |>
+  mutate(
+    NMB_low = { fnArgs <- param_base; fnArgs[[parameter]] <- low; do.call(contrastsTTAA, fnArgs)$NMB },
+    NMB_high = { fnArgs <- param_base; fnArgs[[parameter]] <- high; do.call(contrastsTTAA, fnArgs)$NMB },
+    spread = abs(NMB_high - NMB_low)
+  ) |>
+    ungroup()
+
+# Tornado plot
+ggplot(owsa_results, aes(y = reorder(label, spread))) +
+  geom_segment(aes(x = NMB_low, xend = NMB_high, yend = label), linewidth = 6, color = "steelblue") +
+  geom_vline(xintercept = baseNMB, linetype = "dashed", color = "red") +
+  labs(x = "Net Monetary Benefit (CHF)", y = NULL,
+       title = "Tornado Plot: one-way sensitivity analysis",
+       subtitle = paste0("Mean NMB = CHF ", round(baseNMB, 0))) +
+  theme_minimal()
+
+ggsave("./plots/Tornado.png", width = 10, height = 7, dpi = 300, bg = "white")
+```
+
+
+
+# Stratified Analysis and Equity
+This section investigates how the cost-effectiveness of the intervention changes across different clinical subgroups, specifically comparing a hypothetical patient scenario: those with cancer vs. those without.
+
+## Defining Clinical Scenarios
+We model two hypothetical groups: cancer and non-cancer.
+
+Cancer: Characterised by higher baseline mortality (immunocompromised status), longer baseline length of stay, and potentially lower effectiveness of the intervention.
+
+```{r}
+#| label: 7.1 Define group-specific parameters: Cancer vs Non-Cancer
+# Key differences: Cancer patients have higher baseline mortality due to severity/malignancy 
+# and longer baseline length of stay. 
+# In addition, earlier TTAA may reduce LOS differentially.
+# Long-term survival is also allowed to differ between the 2 groups.
+
+# Cancer group parameters
+params_cancer <- params
+params_cancer$p30_del_mean <- 0.50      # higher baseline mortality than base case
+params_cancer$perHourHR <- 0.97         # early TTAA less effective
+params_cancer$baseline_LOS_days <- 18   # longer LOS
+params_cancer$dLOS_perHour_mean <- params$dLOS_perHour_mean * 0.5 # reduction of LOS due to early TTAA, smaller than baseline
+params_cancer$pLT_del_mean <- 0.07      # higher long-term mortality. Equiv to 50% over 10 years
+params_cancer$pLT_ear_mean <- 0.07      # assumed unchanged
+
+# Non-Cancer group parameters
+params_noncancer <- params
+params_noncancer$p30_del_mean <- 0.25      # lower baseline mortality than base case 
+params_noncancer$perHourHR <- params$perHourHR  # unchanged
+params_noncancer$baseline_LOS_days <- 12   # shorter LOS
+params_noncancer$dLOS_perHour_mean <- params$dLOS_perHour_mean # reduction of LOS due to early TTAA, same as baseline
+params_noncancer$pLT_del_mean <- 0.035     # lower long-term mortality. Equiv to 30% over 10 years
+params_noncancer$pLT_ear_mean <- 0.035     # assumed unchanged
+
+# Recalculate derived intervention-HR (per X-hours) for each group
+hrk_cancer <- getPerIntervalHR(params_cancer$perHourHR, params_cancer$perHourHRSE, params_cancer$dTTAA_hours)
+params_cancer$HR_mean <- hrk_cancer$intHR
+params_cancer$HR_se <- hrk_cancer$intHRSE
+
+hrk_noncancer <- getPerIntervalHR(params_noncancer$perHourHR, params_noncancer$perHourHRSE, params_noncancer$dTTAA_hours)
+params_noncancer$HR_mean <- hrk_noncancer$intHR
+params_noncancer$HR_se <- hrk_noncancer$intHRSE
+```
+
+## Stratified PSA
+```{r}
+#| label: 7.2 PSA, by group
+#| 
+results_psa_cancer <- psa_contrastsTTAA(
+  N                      = params_cancer$N,
+  p30_del_mean           = params_cancer$p30_del_mean,
+  p30_del_se             = params_cancer$p30_del_se,
+  HR_mean                = params_cancer$HR_mean,
+  HR_se                  = params_cancer$HR_se,
+  pLT_del_mean           = params_cancer$pLT_del_mean,
+  pLT_del_se             = params_cancer$pLT_del_se,
+  pLT_ear_mean           = params_cancer$pLT_ear_mean,
+  pLT_ear_se             = params_cancer$pLT_ear_se,
+  u_acute_mean           = params_cancer$u_acute_mean,
+  u_acute_se             = params_cancer$u_acute_se,
+  u_LT_mean              = params_cancer$u_LT_mean,
+  u_LT_se                = params_cancer$u_LT_se,
+  horizon_y              = params_cancer$horizon_y,
+  dt_acute_days          = params_cancer$dt_acute_days,
+  dt_LT_years            = params_cancer$dt_LT_years,
+  discRate               = params_cancer$discRate,
+  dTTAA_hours            = params_cancer$dTTAA_hours,
+  dLOS_perHour_mean      = params_cancer$dLOS_perHour_mean,
+  dLOS_perHour_se        = params_cancer$dLOS_perHour_se,
+  cost_perHospDay_mean   = params_cancer$cost_perHospDay_mean,
+  costMultiplier_HospDay = params_cancer$costMultiplier_HospDay,
+  tech_cost_per_patient  = params_cancer$tech_cost_per_patient,
+  LT_cost_delayed_mean   = params_cancer$LT_cost_delayed_mean,
+  LT_cost_delayed_se     = params_cancer$LT_cost_delayed_se,
+  LT_cost_early_mean     = params_cancer$LT_cost_early_mean,
+  LT_cost_early_se       = params_cancer$LT_cost_early_se,
+  costMultiplier_LT      = params_cancer$costMultiplier_LT,
+  WTP                    = params_cancer$WTP
+) %>% 
+  mutate(Group = "Cancer")
+
+results_psa_noncancer <- psa_contrastsTTAA(
+  N                      = params_noncancer$N,
+  p30_del_mean           = params_noncancer$p30_del_mean,
+  p30_del_se             = params_noncancer$p30_del_se,
+  HR_mean                = params_noncancer$HR_mean,
+  HR_se                  = params_noncancer$HR_se,
+  pLT_del_mean           = params_noncancer$pLT_del_mean,
+  pLT_del_se             = params_noncancer$pLT_del_se,
+  pLT_ear_mean           = params_noncancer$pLT_ear_mean,
+  pLT_ear_se             = params_noncancer$pLT_ear_se,
+  u_acute_mean           = params_noncancer$u_acute_mean,
+  u_acute_se             = params_noncancer$u_acute_se,
+  u_LT_mean              = params_noncancer$u_LT_mean,
+  u_LT_se                = params_noncancer$u_LT_se,
+  horizon_y              = params_noncancer$horizon_y,
+  dt_acute_days          = params_noncancer$dt_acute_days,
+  dt_LT_years            = params_noncancer$dt_LT_years,
+  discRate               = params_noncancer$discRate,
+  dTTAA_hours            = params_noncancer$dTTAA_hours,
+  dLOS_perHour_mean      = params_noncancer$dLOS_perHour_mean,
+  dLOS_perHour_se        = params_noncancer$dLOS_perHour_se,
+  cost_perHospDay_mean   = params_noncancer$cost_perHospDay_mean,
+  costMultiplier_HospDay = params_noncancer$costMultiplier_HospDay,
+  tech_cost_per_patient  = params_noncancer$tech_cost_per_patient,
+  LT_cost_delayed_mean   = params_noncancer$LT_cost_delayed_mean,
+  LT_cost_delayed_se     = params_noncancer$LT_cost_delayed_se,
+  LT_cost_early_mean     = params_noncancer$LT_cost_early_mean,
+  LT_cost_early_se       = params_noncancer$LT_cost_early_se,
+  costMultiplier_LT      = params_noncancer$costMultiplier_LT,
+  WTP                    = params_noncancer$WTP
+) %>% 
+  mutate(Group = "Non-Cancer")
+
+# Bind 2 tibbles
+results_psa_subgroups <- bind_rows(results_psa_cancer, results_psa_noncancer)
+```
+
+## Stratified visualisations
+
+```{r}
+#| label: 7.3 Comparing distributions by Patient Group
+# QALYS
+p4 <-ggplot(results_psa_subgroups, aes(x = d_qalys, fill = Group, color = Group)) +
+  geom_histogram(aes(y = after_stat(density)), alpha = 0.4, position = "identity", bins = 50) +
+  geom_density(alpha = 0, size = 1.2) +
+  scale_fill_manual(values = c("Cancer" = "#E74C3C", "Non-Cancer" = "#3498DB")) +
+  scale_color_manual(values = c("Cancer" = "#C0392B", "Non-Cancer" = "#2874A6")) +
+  labs(x = "Incremental QALYs", y = "Density",
+       title = "Incremental QALYs Distribution by Group",
+       subtitle = "Histograms with density curves overlaid",
+       fill = "Patient Group", color = "Patient Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        legend.position = "top")
+
+# COSTS
+p5 <- ggplot(results_psa_subgroups, aes(x = d_total_costs, fill = Group, color = Group)) +
+  geom_histogram(aes(y = after_stat(density)), alpha = 0.4, position = "identity", bins = 50) +
+  geom_density(alpha = 0, size = 1.2) +
+  scale_fill_manual(values = c("Cancer" = "#E74C3C", "Non-Cancer" = "#3498DB")) +
+  scale_color_manual(values = c("Cancer" = "#C0392B", "Non-Cancer" = "#2874A6")) +
+  labs(x = "Incremental Costs", y = "Density",
+       title = "Incremental Cost Distribution by Group",
+       subtitle = "Histograms with density curves overlaid",
+       fill = "Patient Group", color = "Patient Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        legend.position = "top")
+
+# NMB 
+p6 <- ggplot(results_psa_subgroups, aes(x = NMB, fill = Group, color = Group)) +
+  geom_histogram(aes(y = after_stat(density)), alpha = 0.3, position = "identity", bins = 50) +
+  geom_density(alpha = 0, size = 1.2) +  # Just the line, no fill
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 1) +
+  scale_fill_manual(values = c("Cancer" = "#E74C3C", "Non-Cancer" = "#3498DB")) +
+  scale_color_manual(values = c("Cancer" = "#C0392B", "Non-Cancer" = "#2874A6")) +
+  labs(x = "Net Monetary Benefit (CHF)", y = "Density",
+       title = "NMB Distribution by Group",
+       subtitle = "Histograms with density curves overlaid",
+       fill = "Patient Group", color = "Patient Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        legend.position = "top")
+
+(p4 + p5) / p6
+
+ggsave("./plots/Distributions_stratified.png", width = 10, height = 7, dpi = 300, bg = "white")
+```
+
+```{r}
+#| label: 7.4 Cost-effectiveness plane by Patient Group
+ggplot(results_psa_subgroups, aes(x = d_qalys, y = d_total_costs, color = Group)) +
+  geom_hline(yintercept = 0, color = "gray50") +
+  geom_vline(xintercept = 0, color = "gray50") +
+  geom_abline(slope = params$WTP, intercept = 0, linetype = 2, color = "black", size = 1) +
+  geom_point(alpha = 0.2, size = 1.5) +
+  scale_color_manual(values = c("Cancer" = "#E74C3C", "Non-Cancer" = "#3498DB")) +
+  labs(title = "Cost-Effectiveness Plane by Group",
+       subtitle = paste0("WTP threshold: CHF ", format(params$WTP, big.mark = ",")),
+       x = "Incremental QALYs (Early − Delayed)",
+       y = "Incremental Costs (CHF, Early − Delayed)",
+       color = "Patient Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        legend.position = "top")
+
+ggsave("./plots/CEplane_stratified.png", width = 10, height = 7, dpi = 300, bg = "white")
+```
+
+```{r}
+#| label: 7.5 CEAC by Patient Group
+
+wtp_range <- seq(0, 200000, by = 1000)
+
+ceac_subgroups <- map_dfr(wtp_range, function(wtp) {
+  results_psa_subgroups %>%
+    group_by(Group) %>%
+    summarise(
+      WTP = wtp,
+      prob_CE = mean((wtp * d_qalys - d_total_costs) > 0),
+      .groups = "drop"
+    )
+})
+
+ggplot(ceac_subgroups, aes(x = WTP, y = prob_CE, color = Group)) +
+  geom_line(size = 1.5) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = params$WTP, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Cancer" = "#E74C3C", "Non-Cancer" = "#3498DB")) +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+  labs(x = "Willingness-to-Pay Threshold (CHF/QALY)",
+       y = "Probability Cost-Effective",
+       title = "Cost-Effectiveness Acceptability Curves by Patient Group",
+       color = "Patient Group") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        legend.position = "top")
+
+ggsave("./plots/CEAC_stratified.png", width = 10, height = 7, dpi = 300, bg = "white")
+```
