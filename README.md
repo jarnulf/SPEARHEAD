@@ -6,7 +6,7 @@ https://spearhead-project.ch/
 
 https://www.swissre.com/reinsurance/events/fight-against-antimicrobial-resistance.html
 
-This model was built by Mark J. Lambiris, PhD (European Center of Pharmaceutical Medicine, University of Basel) as part of Subproject 4 (SP4) of the SPEARHEAD consortium.
+The model structure, coding, and implementation were developed by Mark J. Lambiris, PhD as part of Subproject 4 (SP4) which was led by the European Center of Pharmaceutical Medicine, University of Basel, part of the SPEARHEAD consortium.
 
 COPYRIGHT 2026, European Center of Pharmaceutical Medicine and University of Basel
 
