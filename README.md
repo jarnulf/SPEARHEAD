@@ -78,3 +78,12 @@ Underlying project-specific data and some project deliverables are not reproduce
 ## Software
 
 The analysis is written in **R** / **Quarto**.
+
+## Results
+
+Brief SP4 results synopsis
+
+https://spearhead-project.ch/key-results/
+
+https://drive.google.com/file/d/1Ai-NFslJWAGkOqTBirmp6s6qZcnEw34g/view
+
