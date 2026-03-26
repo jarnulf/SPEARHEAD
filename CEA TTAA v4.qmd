@@ -19,7 +19,7 @@ The analysis compares **Standard Care** (Delayed TTAA) vs. **Intervention** (Ear
 
 # Setup and Dependencies
 
-We begin by clearing the environment and loading the necessary libraries for matrix operations, data manipulation, parallel processing, and visualization.
+We begin by loading the necessary libraries for matrix operations, data manipulation, parallel processing, and visualization.
 
 
 ```{r}
@@ -1147,14 +1147,4 @@ ggplot(ceac_subgroups, aes(x = WTP, y = prob_CE, color = Group)) +
         legend.position = "top")
 
 ggsave("./plots/CEAC_stratified.png", width = 10, height = 7, dpi = 300, bg = "white")
-```
-
-```{r}
-# find clinical split e.g. late  stage cancer vs "normal". Or 2 different severe indications (cancer vs cirrhosis etc).They have different life expectancies (model that too)--> QALYs would change too (cancer patients lower long term survival).
-
-# Budget impact: link to SP1 re: averted personnel work days, monetised.
-# Budget impact goal2: institution-level BI (instead of national). from CHUV: ask expected number of patients that would use RES. Multiply this number by cost per test and averted costs due to lower LOS. This is the budget impact for CHUV. Assume the cost here is the "real" cost i.e. what the CHUV needs to pay to provide service. This willbe change in expenditre due to the new tech. "Impact on hosp. expenditure". This is key part of BI.
-
-# Multiscript: send time by month to invoice.
-
 ```
