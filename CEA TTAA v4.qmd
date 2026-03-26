@@ -1,8 +1,9 @@
 ---
 title: "Cost-Effectiveness Analysis: Time to Appropriate Antibiotic Therapy (TTAA)"
 subtitle: "Assessing the Economic Value of Rapid Diagnostics in Bloodstream Infections"
-author: "Research Team"
-date: "`r Sys.Date()`"
+project: "SPEARHEAD consortium, Sub-project 4 (SP4)"
+author: "Mark J. Lambiris, PhD - European Center of Pharmaceutical Medicine, University of Basel"
+date: "last-modified"
 format:
   html:
     toc: true
